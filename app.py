@@ -1,20 +1,19 @@
 import os
-import anthropic
 import requests
+import json
 from slack_bolt import App
 from slack_bolt.adapter.flask import SlackRequestHandler
 from flask import Flask, request
 
-# Initialize
 slack_app = App(
     token=os.environ["SLACK_BOT_TOKEN"],
     signing_secret=os.environ["SLACK_SIGNING_SECRET"]
 )
 flask_app = Flask(__name__)
 handler = SlackRequestHandler(slack_app)
-claude = anthropic.Anthropic(api_key=os.environ["ANTHROPIC_API_KEY"])
 
-# Planogram data
+GEMINI_API_KEY = os.environ["GEMINI_API_KEY"]
+
 PLANOGRAM = {
     "joi mart": [
         {"product": "Aloo Bhujia 200g", "shelf": 5, "expected": 3},
@@ -72,61 +71,62 @@ PLANOGRAM = {
     ]
 }
 
-# Store user sessions
 user_sessions = {}
 
-def analyze_image_with_claude(image_url, store_name):
+def analyze_image_with_gemini(image_url, store_name):
     planogram = PLANOGRAM.get(store_name.lower(), [])
     product_list = "\n".join([f"- {p['product']}" for p in planogram])
     
-    message = claude.messages.create(
-        model="claude-sonnet-4-20250514",
-        max_tokens=1000,
-        messages=[
-            {
-                "role": "user",
-                "content": [
-                    {
-                        "type": "image",
-                        "source": {
-                            "type": "url",
-                            "url": image_url
-                        }
-                    },
-                    {
-                        "type": "text",
-                        "text": f"""Analyze this shelf image for {store_name}.
+    url = f"https://generativelanguage.googleapis.com/v1beta/models/gemini-1.5-flash:generateContent?key={GEMINI_API_KEY}"
+    
+    payload = {
+        "contents": [{
+            "parts": [
+                {
+                    "inline_data": {
+                        "mime_type": "image/jpeg",
+                        "data": get_image_base64(image_url)
+                    }
+                },
+                {
+                    "text": f"""Analyze this shelf image for {store_name}.
 
-Expected products in planogram:
+Expected products:
 {product_list}
 
-For each product you can see, respond in this EXACT format:
-DETECTED: <product name> | QTY: <count> | SHELF: <shelf number>
+For each product visible, respond EXACTLY like this:
+DETECTED: <product name> | QTY: <count> | SHELF: <number>
 
-Only list products you can clearly see. Be precise with product names matching the planogram list."""
-                    }
-                ]
-            }
-        ]
-    )
-    return message.content[0].text
+Only list products clearly visible. Match names exactly from the list above."""
+                }
+            ]
+        }]
+    }
+    
+    response = requests.post(url, json=payload)
+    result = response.json()
+    return result["candidates"][0]["content"]["parts"][0]["text"]
+
+def get_image_base64(image_url):
+    import base64
+    headers = {"Authorization": f"Bearer {os.environ['SLACK_BOT_TOKEN']}"}
+    response = requests.get(image_url, headers=headers)
+    return base64.b64encode(response.content).decode('utf-8')
 
 def compare_with_planogram(detected_text, store_name):
     planogram = PLANOGRAM.get(store_name.lower(), [])
-    
-    # Parse detected products
     detected = {}
+    
     for line in detected_text.split('\n'):
         if 'DETECTED:' in line:
             try:
                 parts = line.split('|')
-                name = parts[0].replace('DETECTED:', '').strip()
+                name = parts[0].replace('DETECTED:', '').strip().lower()
                 qty = int(parts[1].replace('QTY:', '').strip())
-                detected[name.lower()] = qty
+                detected[name] = qty
             except:
                 pass
     
-    # Compare
     matched = []
     missing = []
     low_stock = []
@@ -138,44 +138,28 @@ def compare_with_planogram(detected_text, store_name):
             if found_qty >= item['expected']:
                 matched.append(item)
             else:
-                low_stock.append({
-                    **item,
-                    'found': found_qty,
-                    'needed': item['expected'] - found_qty
-                })
+                low_stock.append({**item, 'found': found_qty, 'needed': item['expected'] - found_qty})
         else:
             missing.append(item)
     
     total = len(planogram)
     compliance = round((len(matched) / total) * 100) if total > 0 else 0
     
-    return {
-        'compliance': compliance,
-        'matched': matched,
-        'missing': missing,
-        'low_stock': low_stock,
-        'total': total
-    }
+    return {'compliance': compliance, 'matched': matched, 'missing': missing, 'low_stock': low_stock, 'total': total}
 
 def format_results(results, store_name):
     compliance = results['compliance']
-    
-    if compliance >= 75:
-        score_emoji = "🟢"
-    elif compliance >= 50:
-        score_emoji = "🟡"
-    else:
-        score_emoji = "🔴"
+    emoji = "🟢" if compliance >= 75 else "🟡" if compliance >= 50 else "🔴"
     
     msg = f"""✅ *Shelf Audit Complete - {store_name}*
 
 ━━━━━━━━━━━━━━━━━━━
-{score_emoji} *COMPLIANCE SCORE: {compliance}%*
+{emoji} *COMPLIANCE SCORE: {compliance}%*
 ━━━━━━━━━━━━━━━━━━━
 
-✅ Correct Products: {len(results['matched'])}
+✅ Correct: {len(results['matched'])} products
 ⚠️ Low Stock: {len(results['low_stock'])} products
-❌ Missing SKUs: {len(results['missing'])} products
+❌ Missing: {len(results['missing'])} products
 """
     
     if results['missing']:
@@ -190,54 +174,44 @@ def format_results(results, store_name):
     
     msg += """
 ━━━━━━━━━━━━━━━━━━━
-*What would you like to do?*
+*What next?*
 1️⃣ Generate Replenishment Order
 2️⃣ Create Audit Actions
 3️⃣ Both
 4️⃣ Finish
 
 Reply with 1, 2, 3, or 4"""
-    
     return msg
 
 def generate_replenishment(results, store_name):
     items = results['missing'] + results['low_stock']
     if not items:
-        return "✅ No replenishment needed! All products are well stocked."
+        return "✅ No replenishment needed!"
     
     msg = f"📦 *Replenishment Order - {store_name}*\n\n"
-    total_units = 0
-    
+    total = 0
     for item in items:
         needed = item.get('needed', item.get('expected', 0))
-        total_units += needed
-        msg += f"• {item['product']}: *{needed} units* (Shelf {item['shelf']})\n"
+        total += needed
+        msg += f"• {item['product']}: *{needed} units* → Shelf {item['shelf']}\n"
     
-    msg += f"\n*Total Units Needed: {total_units}*\n✅ Order saved in Salesforce!"
+    msg += f"\n*Total: {total} units*\n✅ Order saved in Salesforce!"
     return msg
 
 def generate_audit_actions(results, store_name):
     compliance = results['compliance']
-    
-    if compliance < 50:
-        priority = "🔴 HIGH"
-    elif compliance < 75:
-        priority = "🟡 MEDIUM"
-    else:
-        priority = "🟢 LOW"
-    
+    priority = "🔴 HIGH" if compliance < 50 else "🟡 MEDIUM" if compliance < 75 else "🟢 LOW"
     items = results['missing'] + results['low_stock']
+    
     if not items:
         return "✅ No audit actions needed!"
     
-    msg = f"📋 *Audit Actions - {store_name}*\n"
-    msg += f"Priority: {priority}\n\n"
-    
+    msg = f"📋 *Audit Actions - {store_name}*\nPriority: {priority}\n\n"
     for item in items:
         needed = item.get('needed', item.get('expected', 0))
         msg += f"• Restock {item['product']} → {needed} units on Shelf {item['shelf']}\n"
     
-    msg += f"\n✅ {len(items)} actions saved in Salesforce!\n🎉 Audit Complete! Great work today! 👍"
+    msg += f"\n✅ {len(items)} actions saved!\n🎉 Audit Complete! Great work! 👍"
     return msg
 
 @slack_app.event("message")
@@ -251,7 +225,6 @@ def handle_message(event, say):
     
     session = user_sessions.get(user_id, {"step": "start"})
     
-    # Step 1 - Store Selection
     if session["step"] == "start" or text.lower() in ["hi", "hello", "start", "audit"]:
         user_sessions[user_id] = {"step": "store_selection"}
         say("""👋 *Welcome to ABC Foods Shelf Audit!*
@@ -264,7 +237,6 @@ Which store are you visiting today?
 Reply with 1, 2, or 3""")
         return
     
-    # Step 2 - Store Selected
     if session["step"] == "store_selection":
         store_map = {"1": "Joi Mart", "2": "MMart", "3": "D-Mart"}
         store = store_map.get(text)
@@ -272,43 +244,34 @@ Reply with 1, 2, or 3""")
             say("Please reply with 1, 2, or 3 to select your store.")
             return
         user_sessions[user_id] = {"step": "photo", "store": store}
-        say(f"✅ Got it! You are visiting *{store}* today.\n\n📸 Please share a shelf photo for the audit.")
+        say(f"✅ Got it! Visiting *{store}* today.\n\n📸 Please share a shelf photo for the audit.")
         return
     
-    # Step 3 - Photo Received
     if session["step"] == "photo":
         image_url = None
-        
         if files:
             for f in files:
                 if f.get("mimetype", "").startswith("image/"):
                     image_url = f.get("url_private_download")
                     break
-        
         if not image_url and "http" in text:
             image_url = text.strip()
-        
         if not image_url:
-            say("📸 Please share a shelf photo to continue the audit.")
+            say("📸 Please share a shelf photo to continue.")
             return
         
         store = session["store"]
-        say(f"✅ Photo received for *{store}*!\n🔍 Analyzing your shelf now... Please wait a moment.")
+        say(f"✅ Photo received for *{store}*!\n🔍 Analyzing shelf... Please wait.")
         
         try:
-            detected = analyze_image_with_claude(image_url, store)
+            detected = analyze_image_with_gemini(image_url, store)
             results = compare_with_planogram(detected, store)
-            user_sessions[user_id] = {
-                "step": "action",
-                "store": store,
-                "results": results
-            }
+            user_sessions[user_id] = {"step": "action", "store": store, "results": results}
             say(format_results(results, store))
         except Exception as e:
-            say(f"❌ Error analyzing image: {str(e)}\nPlease try again.")
+            say(f"❌ Error: {str(e)}\nPlease try again.")
         return
     
-    # Step 4 - Action Selection
     if session["step"] == "action":
         store = session["store"]
         results = session["results"]
@@ -324,7 +287,7 @@ Reply with 1, 2, or 3""")
             say(generate_audit_actions(results, store))
             user_sessions[user_id] = {"step": "start"}
         elif text == "4":
-            say(f"✅ Audit finished for *{store}*! Great work today! 👍")
+            say(f"✅ Audit finished for *{store}*! Great work! 👍")
             user_sessions[user_id] = {"step": "start"}
         else:
             say("Please reply with 1, 2, 3, or 4")
