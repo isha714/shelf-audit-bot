@@ -1,0 +1,13 @@
+services:
+  - type: web
+    name: shelf-audit-bot
+    env: python
+    buildCommand: pip install -r requirements.txt
+    startCommand: gunicorn app:flask_app
+    envVars:
+      - key: SLACK_BOT_TOKEN
+        sync: false
+      - key: SLACK_SIGNING_SECRET
+        sync: false
+      - key: ANTHROPIC_API_KEY
+        sync: false
